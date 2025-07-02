@@ -6,135 +6,77 @@ from PIL import Image
 import os
 from sklearn.cluster import DBSCAN
 import sys
-from PyQt5.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget, QFileDialog
+from PyQt5.QtWidgets import (QApplication, QLabel, QVBoxLayout,
+                             QWidget, QPushButton, QFileDialog)
 from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
 
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Используется устройство: {device}")
+class VideoThread(QThread):
+    change_pixmap_signal = pyqtSignal(np.ndarray)
+    detection_complete = pyqtSignal(list)
 
-model = InceptionResnetV1(pretrained='vggface2').eval().to(device)
-mtcnn = MTCNN_FT(keep_all=True, device=device)
+    def __init__(self, video_path, model, mtcnn):
+        super().__init__()
+        self.video_path = video_path
+        self.model = model
+        self.mtcnn = mtcnn
+        self._run_flag = True
+        self.face_positions = []
 
+    def run(self):
+        cap = cv2.VideoCapture(self.video_path)
+        frame_rate = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = 0
 
-video_path = 'input_video.mp4'
-output_dir = 'detected_faces'
-os.makedirs(output_dir, exist_ok=True)
+        while self._run_flag and cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-cap = cv2.VideoCapture(video_path)
-frame_rate = cap.get(cv2.CAP_PROP_FPS)
-frame_count = 0
-all_embeddings = []
-face_positions = []
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb_frame)
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
+            boxes, _ = self.mtcnn.detect(pil_img)
 
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(rgb_frame)
+            if boxes is not None:
+                for box in boxes:
+                    try:
+                        x1, y1, x2, y2 = box.astype(int)
 
-    boxes, _ = mtcnn.detect(pil_img)
+                        x1, y1 = max(0, x1), max(0, y1)
+                        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
 
-    if boxes is not None:
-        for box in boxes:
-            try:
-                x1, y1, x2, y2 = box.astype(int)
-                x1 = max(0, x1)
-                y1 = max(0, y1)
-                x2 = min(frame.shape[1], x2)
-                y2 = min(frame.shape[0], y2)
+                        if x2 > x1 and y2 > y1:
+                            face_img = rgb_frame[y1:y2, x1:x2]
+                            if face_img.size > 0:
+                                face_pil = Image.fromarray(face_img).resize((160, 160))
+                                face_tensor = torch.tensor(np.array(face_pil) / 255.0).permute(2, 0, 1).unsqueeze(
+                                    0).float().to(self.model.device)
 
-                face_img = rgb_frame[y1:y2, x1:x2]
+                                with torch.no_grad():
+                                    embedding = self.model(face_tensor).cpu().numpy()
 
-                if face_img.size == 0 or face_img.shape[0] < 20 or face_img.shape[1] < 20:
-                    continue
+                                self.face_positions.append({
+                                    'frame': frame_count,
+                                    'time': frame_count / frame_rate,
+                                    'bbox': [x1, y1, x2 - x1, y2 - y1],
+                                    'embedding': embedding
+                                })
 
-                face_pil = Image.fromarray(face_img).resize((160, 160))
-                face_tensor = torch.tensor(np.array(face_pil) / 255.0)
-                face_tensor = face_tensor.permute(2, 0, 1).unsqueeze(0).float().to(device)
+                                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    except Exception as e:
+                        print(f"Error processing face: {e}")
 
-                with torch.no_grad():
-                    embedding = model(face_tensor).cpu().numpy()
+            self.change_pixmap_signal.emit(frame)
+            frame_count += 1
 
-                all_embeddings.append(embedding)
-                face_positions.append({
-                    'frame': frame_count,
-                    'time': frame_count / frame_rate,
-                    'bbox': [x1, y1, abs(x2 - x1), abs(y2 - y1)],  # x, y, width, height
-                    'id': None
-                })
+        cap.release()
+        self.detection_complete.emit(self.face_positions)
 
-            except Exception as e:
-                print(f"Ошибка обработки лица: {e}")
-                continue
-
-    frame_count += 1
-
-cap.release()
-
-if not all_embeddings:
-    print("Лица не найдены.")
-    exit()
-
-
-embeddings_stack = np.vstack(all_embeddings)
-clt = DBSCAN(metric="euclidean", eps=0.6, min_samples=2)
-clt.fit(embeddings_stack)
-
-for i, label in enumerate(clt.labels_):
-    face_positions[i]['id'] = label
-
-
-cap = cv2.VideoCapture(video_path)
-for idx, info in enumerate(face_positions):
-    face_id = info['id']
-    frame_num = info['frame']
-    x, y, w, h = info['bbox']
-
-    cluster_dir = os.path.join(output_dir, f"person_{face_id}")
-    os.makedirs(cluster_dir, exist_ok=True)
-
-    filename = os.path.join(cluster_dir, f"frame_{frame_num}.jpg")
-
-    if not os.path.exists(filename):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-        ret, frame = cap.read()
-        if ret:
-            x1, y1 = x, y
-            x2, y2 = x + w, y + h
-
-
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(frame.shape[1], x2)
-            y2 = min(frame.shape[0], y2)
-
-            if x2 > x1 and y2 > y1:
-                face_crop = frame[y1:y2, x1:x2]
-                if face_crop.size > 0:
-                    cv2.imwrite(filename, face_crop)
-                else:
-                    print(f"Пустое изображение для {filename}")
-            else:
-                print(f"Некорректные координаты: {x1}, {y1}, {x2}, {y2}")
-        else:
-            print(f"Не удалось прочитать кадр {frame_num}")
-cap.release()
-
-import torch
-from facenet_pytorch import MTCNN as MTCNN_FT, InceptionResnetV1
-import cv2
-import numpy as np
-from PIL import Image
-import os
-from sklearn.cluster import DBSCAN
-import sys
-from PyQt5.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget, QPushButton
-from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import QTimer, Qt
+    def stop(self):
+        self._run_flag = False
+        self.wait()
 
 
 class FaceDetectorApp(QWidget):
@@ -143,12 +85,11 @@ class FaceDetectorApp(QWidget):
         self.setWindowTitle("Face Detector")
         self.setGeometry(100, 100, 800, 600)
 
-        # Инициализация моделей
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
         self.model = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
         self.mtcnn = MTCNN_FT(keep_all=True, device=self.device)
 
-        # Элементы интерфейса
         self.label = QLabel(self)
         self.label.setAlignment(Qt.AlignCenter)
 
@@ -159,98 +100,81 @@ class FaceDetectorApp(QWidget):
         self.btn_start.clicked.connect(self.start_detection)
         self.btn_start.setEnabled(False)
 
+        self.btn_stop = QPushButton("Stop", self)
+        self.btn_stop.clicked.connect(self.stop_detection)
+        self.btn_stop.setEnabled(False)
+
         layout = QVBoxLayout()
         layout.addWidget(self.label)
         layout.addWidget(self.btn_open)
         layout.addWidget(self.btn_start)
+        layout.addWidget(self.btn_stop)
         self.setLayout(layout)
 
-        # Переменные для обработки видео
-        self.cap = None
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_frame)
-        self.face_positions = []
-        self.frame_rate = 30
-        self.current_frame = 0
+        self.thread = None
+        self.output_dir = "detected_faces"
+        os.makedirs(self.output_dir, exist_ok=True)
 
     def open_video(self):
         filepath, _ = QFileDialog.getOpenFileName(self, "Open Video", "", "Video Files (*.mp4 *.avi)")
         if filepath:
-            self.cap = cv2.VideoCapture(filepath)
-            self.frame_rate = self.cap.get(cv2.CAP_PROP_FPS)
+            self.video_path = filepath
             self.btn_start.setEnabled(True)
 
-            # Показать первый кадр
-            ret, frame = self.cap.read()
+            cap = cv2.VideoCapture(filepath)
+            ret, frame = cap.read()
             if ret:
                 self.display_frame(frame)
+            cap.release()
 
     def start_detection(self):
-        if self.cap is None:
-            return
+        if hasattr(self, 'video_path'):
+            self.btn_open.setEnabled(False)
+            self.btn_start.setEnabled(False)
+            self.btn_stop.setEnabled(True)
 
-        self.btn_open.setEnabled(False)
-        self.btn_start.setEnabled(False)
+            self.thread = VideoThread(self.video_path, self.model, self.mtcnn)
+            self.thread.change_pixmap_signal.connect(self.display_frame)
+            self.thread.detection_complete.connect(self.on_detection_complete)
+            self.thread.start()
 
-        # Сбросить видео на начало
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        self.current_frame = 0
-        self.face_positions = []
+    def stop_detection(self):
+        if self.thread:
+            self.thread.stop()
+            self.btn_open.setEnabled(True)
+            self.btn_start.setEnabled(True)
+            self.btn_stop.setEnabled(False)
 
-        # Начать обработку
-        self.timer.start(1000 // self.frame_rate)
-
-    def update_frame(self):
-        ret, frame = self.cap.read()
-        if not ret:
-            self.timer.stop()
-            self.process_faces()
-            return
-
-        self.current_frame += 1
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(rgb_frame)
-
-        # Обнаружение лиц
-        boxes, _ = self.mtcnn.detect(pil_img)
-
-        if boxes is not None:
-            for box in boxes:
-                try:
-                    x1, y1, x2, y2 = box.astype(int)
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-
-                    face_img = rgb_frame[y1:y2, x1:x2]
-                    if face_img.size == 0:
-                        continue
-
-                    # Сохраняем информацию о лице
-                    self.face_positions.append({
-                        'frame': self.current_frame,
-                        'bbox': [x1, y1, x2 - x1, y2 - y1]
-                    })
-
-                    # Рисуем рамку
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-                except Exception as e:
-                    print(f"Error processing face: {e}")
-
-        self.display_frame(frame)
-
-    def process_faces(self):
-        if not self.face_positions:
+    def on_detection_complete(self, face_positions):
+        if not face_positions:
             print("No faces detected")
             return
 
-        # Здесь можно добавить кластеризацию и сохранение лиц
-        print(f"Detected {len(self.face_positions)} faces")
+        embeddings = np.vstack([f['embedding'] for f in face_positions])
+        clt = DBSCAN(metric="euclidean", eps=0.6, min_samples=2)
+        labels = clt.fit_predict(embeddings)
+
+        cap = cv2.VideoCapture(self.video_path)
+        for i, label in enumerate(labels):
+            info = face_positions[i]
+            cluster_dir = os.path.join(self.output_dir, f"person_{label}")
+            os.makedirs(cluster_dir, exist_ok=True)
+
+            filename = os.path.join(cluster_dir, f"frame_{info['frame']}.jpg")
+            if not os.path.exists(filename):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, info['frame'])
+                ret, frame = cap.read()
+                if ret:
+                    x, y, w, h = info['bbox']
+                    face_crop = frame[y:y + h, x:x + w]
+                    if face_crop.size > 0:
+                        cv2.imwrite(filename, face_crop)
+
+        cap.release()
+        print(f"Saved {len(face_positions)} faces to {self.output_dir}")
         self.btn_open.setEnabled(True)
         self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
 
     def display_frame(self, frame):
         rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -260,8 +184,8 @@ class FaceDetectorApp(QWidget):
         self.label.setPixmap(QPixmap.fromImage(qt_image))
 
     def closeEvent(self, event):
-        if self.cap is not None:
-            self.cap.release()
+        if hasattr(self, 'thread') and self.thread:
+            self.thread.stop()
         event.accept()
 
 
