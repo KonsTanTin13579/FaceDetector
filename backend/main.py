@@ -1,15 +1,14 @@
-import torch
-from facenet_pytorch import MTCNN as MTCNN_FT, InceptionResnetV1
+import os
 import cv2
+import sys
+import torch
 import numpy as np
 from PIL import Image
-import os
 from sklearn.cluster import DBSCAN
-import sys
-from PyQt5.QtWidgets import (QApplication, QLabel, QVBoxLayout,
-                             QWidget, QPushButton, QFileDialog)
+from facenet_pytorch import MTCNN, InceptionResnetV1
+from PyQt5.QtWidgets import (QApplication, QLabel, QVBoxLayout, QWidget, QPushButton, QFileDialog)
 from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 
 class VideoThread(QThread):
@@ -88,7 +87,7 @@ class FaceDetectorApp(QWidget):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
         self.model = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
-        self.mtcnn = MTCNN_FT(keep_all=True, device=self.device)
+        self.mtcnn = MTCNN(keep_all=True, device=self.device)
 
         self.label = QLabel(self)
         self.label.setAlignment(Qt.AlignCenter)
@@ -149,6 +148,7 @@ class FaceDetectorApp(QWidget):
         if not face_positions:
             print("No faces detected")
             return
+        return
 
         embeddings = np.vstack([f['embedding'] for f in face_positions])
         clt = DBSCAN(metric="euclidean", eps=0.6, min_samples=2)
