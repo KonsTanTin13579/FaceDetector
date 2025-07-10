@@ -5,21 +5,22 @@ import torch
 import numpy as np
 from PIL import Image
 from sklearn.cluster import DBSCAN
-from facenet_pytorch import MTCNN, InceptionResnetV1
 from PyQt5.QtWidgets import (QApplication, QLabel, QVBoxLayout, QWidget, QPushButton, QFileDialog)
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from facenet_pytorch import InceptionResnetV1
+from retinaface import RetinaFace
 
 
 class VideoThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
     detection_complete = pyqtSignal(list)
 
-    def __init__(self, video_path, model, mtcnn):
+    def __init__(self, video_path, face_rec_model, device):
         super().__init__()
         self.video_path = video_path
-        self.model = model
-        self.mtcnn = mtcnn
+        self.face_rec_model = face_rec_model
+        self.device = device
         self._run_flag = True
         self.face_positions = []
 
@@ -33,28 +34,29 @@ class VideoThread(QThread):
             if not ret:
                 break
 
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(rgb_frame)
+            # Детекция лиц с RetinaFace
+            faces = RetinaFace.detect_faces(frame)
 
-            boxes, _ = self.mtcnn.detect(pil_img)
-
-            if boxes is not None:
-                for box in boxes:
+            if isinstance(faces, dict):
+                for face_id, face_info in faces.items():
                     try:
-                        x1, y1, x2, y2 = box.astype(int)
+                        facial_area = face_info['facial_area']
+                        x1, y1, x2, y2 = facial_area
+                        landmarks = face_info['landmarks']
 
                         x1, y1 = max(0, x1), max(0, y1)
                         x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
 
                         if x2 > x1 and y2 > y1:
-                            face_img = rgb_frame[y1:y2, x1:x2]
+                            face_img = frame[y1:y2, x1:x2]
                             if face_img.size > 0:
-                                face_pil = Image.fromarray(face_img).resize((160, 160))
-                                face_tensor = torch.tensor(np.array(face_pil) / 255.0).permute(2, 0, 1).unsqueeze(
-                                    0).float().to(self.model.device)
+                                # Конвертируем изображение и переносим на то же устройство, что и модель
+                                face_pil = Image.fromarray(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)).resize((160, 160))
+                                face_tensor = torch.tensor(np.array(face_pil) / 255.0).permute(2, 0, 1).unsqueeze(0).float()
+                                face_tensor = face_tensor.to(self.device)  # Переносим на правильное устройство
 
                                 with torch.no_grad():
-                                    embedding = self.model(face_tensor).cpu().numpy()
+                                    embedding = self.face_rec_model(face_tensor).cpu().numpy()
 
                                 self.face_positions.append({
                                     'frame': frame_count,
@@ -64,6 +66,10 @@ class VideoThread(QThread):
                                 })
 
                                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                                # Рисуем landmarks
+                                for landmark_name, point in landmarks.items():
+                                    cv2.circle(frame, tuple(map(int, point)), 2, (0, 0, 255), -1)
                     except Exception as e:
                         print(f"Error processing face: {e}")
 
@@ -81,13 +87,14 @@ class VideoThread(QThread):
 class FaceDetectorApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Face Detector")
+        self.setWindowTitle("Face Detector (RetinaFace)")
         self.setGeometry(100, 100, 800, 600)
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
-        self.model = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
-        self.mtcnn = MTCNN(keep_all=True, device=self.device)
+
+        # Модель для извлечения признаков
+        self.face_rec_model = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
 
         self.label = QLabel(self)
         self.label.setAlignment(Qt.AlignCenter)
@@ -132,7 +139,7 @@ class FaceDetectorApp(QWidget):
             self.btn_start.setEnabled(False)
             self.btn_stop.setEnabled(True)
 
-            self.thread = VideoThread(self.video_path, self.model, self.mtcnn)
+            self.thread = VideoThread(self.video_path, self.face_rec_model, self.device)
             self.thread.change_pixmap_signal.connect(self.display_frame)
             self.thread.detection_complete.connect(self.on_detection_complete)
             self.thread.start()
@@ -148,7 +155,6 @@ class FaceDetectorApp(QWidget):
         if not face_positions:
             print("No faces detected")
             return
-        return
 
         embeddings = np.vstack([f['embedding'] for f in face_positions])
         clt = DBSCAN(metric="euclidean", eps=0.6, min_samples=2)

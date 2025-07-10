@@ -20,9 +20,6 @@ app = FastAPI(
 )
 
 
-class CORSMiddleware:
-    pass
-
 
 app.add_middleware(
     CORSMiddleware,
