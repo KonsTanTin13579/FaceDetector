@@ -34,7 +34,6 @@ class VideoThread(QThread):
             if not ret:
                 break
 
-            # Детекция лиц с RetinaFace
             faces = RetinaFace.detect_faces(frame)
 
             if isinstance(faces, dict):
@@ -50,10 +49,10 @@ class VideoThread(QThread):
                         if x2 > x1 and y2 > y1:
                             face_img = frame[y1:y2, x1:x2]
                             if face_img.size > 0:
-                                # Конвертируем изображение и переносим на то же устройство, что и модель
+                             
                                 face_pil = Image.fromarray(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)).resize((160, 160))
                                 face_tensor = torch.tensor(np.array(face_pil) / 255.0).permute(2, 0, 1).unsqueeze(0).float()
-                                face_tensor = face_tensor.to(self.device)  # Переносим на правильное устройство
+                                face_tensor = face_tensor.to(self.device)
 
                                 with torch.no_grad():
                                     embedding = self.face_rec_model(face_tensor).cpu().numpy()
